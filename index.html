@@ -8,7 +8,7 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Cairo', 'Tajawal', sans-serif; }
 :root {
@@ -299,7 +299,13 @@ table tr:hover { background: #f8f9fa; }
 .qr-timer { font-size: 24px; color: var(--accent); font-weight: 700; margin-top: 15px; }
 
 /* QR Scanner */
-#qr-reader { width: 100%; max-width: 400px; margin: 0 auto; border-radius: 15px; overflow: hidden; }
+#qr-reader { width: 100%; max-width: 400px; margin: 0 auto; border-radius: 15px; overflow: hidden; position: relative; background: #000; min-height: 280px; display: flex; align-items: center; justify-content: center; }
+#qr-reader video { width: 100%; height: auto; display: block; border-radius: 15px; }
+#qr-reader canvas { display: none; }
+#qr-reader .scan-overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 60%; aspect-ratio: 1; border: 3px solid var(--primary); border-radius: 15px; box-shadow: 0 0 0 9999px rgba(0,0,0,0.35); pointer-events: none; }
+#qr-reader .scan-line { position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--primary); box-shadow: 0 0 10px var(--primary); animation: scanMove 2s linear infinite; }
+@keyframes scanMove { 0% { top: 0; } 50% { top: 100%; } 100% { top: 0; } }
+#qr-reader .scan-placeholder { color: #fff; font-size: 14px; text-align: center; padding: 30px; }
 .scan-result {
   margin-top: 20px; padding: 20px; border-radius: 12px; text-align: center;
   font-weight: 700; font-size: 18px;
@@ -988,28 +994,110 @@ function viewScan(c) {
       <button class="cta-btn" onclick="startScanner()" id="scanBtn">
         <i class="fas fa-qrcode"></i> بدء المسح
       </button>
-      <div id="qr-reader" style="margin-top:25px;"></div>
+      <button class="cta-btn" onclick="stopScanner()" id="stopScanBtn" style="display:none; background:var(--accent);">
+        <i class="fas fa-stop"></i> إيقاف المسح
+      </button>
+      <div id="qr-reader" style="margin-top:25px;">
+        <div class="scan-placeholder">اضغط "بدء المسح" لتشغيل الكاميرا</div>
+      </div>
       <div id="scanResult"></div>
     </div>
   `;
 }
 
-function startScanner() {
+// متغيرات الماسح الجديد (jsQR)
+let scanVideoEl = null;
+let scanCanvasEl = null;
+let scanStream = null;
+let scanAnimationId = null;
+let scanActive = false;
+
+async function startScanner() {
+  const reader = document.getElementById('qr-reader');
+  if (!reader) return;
+
+  // التحقق من دعم المتصفح
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast('المتصفح لا يدعم الوصول إلى الكاميرا. الرجاء استخدام HTTPS ومتصفح حديث.', 'error');
+    return;
+  }
+
   document.getElementById('scanBtn').style.display = 'none';
-  qrScanner = new Html5Qrcode("qr-reader");
-  qrScanner.start({ facingMode: "environment" },
-    { fps: 10, qrbox: 250 },
-    onScanSuccess,
-    () => {}
-  ).catch(err => showToast('فشل تشغيل الكاميرا: ' + err, 'error'));
+  const stopBtn = document.getElementById('stopScanBtn');
+  if (stopBtn) stopBtn.style.display = 'inline-flex';
+
+  // تجهيز عناصر الفيديو والكانفاس
+  reader.innerHTML = `
+    <video id="scanVideo" playsinline muted autoplay></video>
+    <canvas id="scanCanvas"></canvas>
+    <div class="scan-overlay"><div class="scan-line"></div></div>
+  `;
+  scanVideoEl = document.getElementById('scanVideo');
+  scanCanvasEl = document.getElementById('scanCanvas');
+
+  try {
+    scanStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' } },
+      audio: false
+    });
+    scanVideoEl.srcObject = scanStream;
+    scanVideoEl.setAttribute('playsinline', true);
+    await scanVideoEl.play();
+    scanActive = true;
+    requestAnimationFrame(tickScanner);
+  } catch (err) {
+    console.error(err);
+    let msg = 'فشل تشغيل الكاميرا. ';
+    if (err.name === 'NotAllowedError') msg += 'الرجاء السماح بالوصول إلى الكاميرا.';
+    else if (err.name === 'NotFoundError') msg += 'لم يتم العثور على كاميرا.';
+    else if (err.name === 'NotReadableError') msg += 'الكاميرا مستخدمة من تطبيق آخر.';
+    else msg += err.message || '';
+    showToast(msg, 'error');
+    stopScanner();
+  }
+}
+
+function tickScanner() {
+  if (!scanActive || !scanVideoEl || !scanCanvasEl) return;
+  if (scanVideoEl.readyState === scanVideoEl.HAVE_ENOUGH_DATA) {
+    const w = scanVideoEl.videoWidth;
+    const h = scanVideoEl.videoHeight;
+    scanCanvasEl.width = w;
+    scanCanvasEl.height = h;
+    const ctx = scanCanvasEl.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(scanVideoEl, 0, 0, w, h);
+    try {
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const code = jsQR(imgData.data, w, h, { inversionAttempts: 'dontInvert' });
+      if (code && code.data) {
+        scanActive = false;
+        onScanSuccess(code.data);
+        return;
+      }
+    } catch (e) { /* ignore frame errors */ }
+  }
+  scanAnimationId = requestAnimationFrame(tickScanner);
+}
+
+function stopScanner() {
+  scanActive = false;
+  if (scanAnimationId) { cancelAnimationFrame(scanAnimationId); scanAnimationId = null; }
+  if (scanStream) {
+    scanStream.getTracks().forEach(t => t.stop());
+    scanStream = null;
+  }
+  if (scanVideoEl) { scanVideoEl.srcObject = null; scanVideoEl = null; }
+  scanCanvasEl = null;
+  const reader = document.getElementById('qr-reader');
+  if (reader) reader.innerHTML = '<div class="scan-placeholder">اضغط "بدء المسح" لتشغيل الكاميرا</div>';
+  const scanBtn = document.getElementById('scanBtn');
+  const stopBtn = document.getElementById('stopScanBtn');
+  if (scanBtn) scanBtn.style.display = 'inline-flex';
+  if (stopBtn) stopBtn.style.display = 'none';
 }
 
 async function onScanSuccess(token) {
-  if (qrScanner) {
-    await qrScanner.stop();
-    qrScanner.clear();
-  }
-  document.getElementById('scanBtn').style.display = 'inline-flex';
+  stopScanner();
 
   // التحقق من صلاحية الكود
   const { data: qr } = await supa.from('attendance_qr')
@@ -1290,7 +1378,7 @@ window.addEventListener('load', () => {
 });
 
 function closeScanner() {
-  if (qrScanner) qrScanner.stop().then(() => qrScanner.clear());
+  stopScanner();
   closeModal('scannerModal');
 }
 
@@ -1299,6 +1387,7 @@ document.querySelectorAll('.modal').forEach(m => {
   m.addEventListener('click', (e) => { if (e.target === m) m.classList.remove('active'); });
 });
 </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447" integrity="sha512-57MDmcccJXYtNnH+ZiBwzC4jb2rvgVCEokYN+L/nLlmO8rfYT/gIpW2A569iJ/3b+0UEasghjuZH/ma3wIs/EQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447" integrity="sha512-57MDmcccJXYtNnH+ZiBwzC4jb2rvgVCEokYN+L/nLlmO8rfYT/gIpW2A569iJ/3b+0UEasghjuZH/ma3wIs/EQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>
